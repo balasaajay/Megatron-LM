@@ -34,8 +34,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
-    DynamicInferenceEvent,
-    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -46,6 +44,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import (
     Counter,
+    asyncio_Queue,
+    asyncio_QueueShutDown,
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -111,6 +111,10 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+
+# Used to turn a synchronous CUDA event wait into an asynchronous yielding poll.
+# Should be set to <1% of the forward step time. A value of 0 is safe, but may be inefficient.
+CUDA_EVENT_POLL_INTERVAL_S = 1e-4
 
 
 class EngineState(Enum):
@@ -222,6 +226,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
+        self.request_bookkeeping_lag = inference_config.request_bookkeeping_lag
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
@@ -291,6 +296,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        # lag < 0 -> unbounded (asyncio maxsize=0)
+        # lag == 0 -> maxsize=1 (special synchronous join() after each put)
+        # lag > 0 -> maxsize=lag (with no synchronous join at all)
+        if self.request_bookkeeping_lag < 0:
+            queue_maxsize = 0
+        elif self.request_bookkeeping_lag == 0:
+            queue_maxsize = 1
+        else:
+            queue_maxsize = self.request_bookkeeping_lag
+        self._bookkeep_queue: asyncio_Queue = asyncio_Queue(maxsize=queue_maxsize)
         self.state = EngineState.RUNNING
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
@@ -1037,9 +1052,10 @@ class DynamicInferenceEngine(AbstractEngine):
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
-        """
-        Handles post-processing for requests after a step.
+    ) -> Dict:
+        """Handles the segment of request post-processing that must be run synchronously.
+
+        All other request post-processing can be deferred until a later time.
 
         Args:
             request_ids (torch.Tensor): A list of request_ids
@@ -1056,19 +1072,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 [num_tokens_this_step, num_layers, topk].
 
         Returns:
-            A list of active requests and completed requests as `DynamicInferenceRequest` objects
+            A snapshot dict consumed by `_post_process_requests_immediate` and
+            ultimately by the deferred bookkeeping phase.
         """
         active_request_ids: list[int] = []
-        finished_request_ids = set(finished_request_ids.tolist())
-        finished_request_records: list[DynamicInferenceRequestRecord] = []
-        self.finished_request_count += len(finished_request_ids)
-        if evict_request_ids is not None:
-            self.evicted_request_count += evict_request_ids.numel()
+        finished_request_ids_set = set(finished_request_ids.tolist())
+        per_request_state: list[Dict] = []
+
+        # Snapshot stop_word_being_finished_ids for the deferred bookkeeping to use.
+        skip_for_stop_word = frozenset(self.stop_word_being_finished_ids)
 
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.kv_block_allocator
 
-        # Pre-compute step-level block stats (before the per-request loop)
+        # Pre-compute step-level block stats. Snapshotted for the deferred bookkeeping.
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
@@ -1077,13 +1094,22 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
+            blocks_total = block_allocator.total_count
+        else:
+            blocks_allocated = None
+            blocks_hashed_active = None
+            blocks_ref_count = None
+            blocks_total = None
 
         # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
         # empty lists for each request, so the zip produces the correct number of iterations
         accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
 
+        step_spec_tokens_proposed = 0
+        step_spec_tokens_accepted = 0
+        step_spec_steps = 0
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
-            self._spec_steps += 1
+            step_spec_steps = 1
 
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
@@ -1093,6 +1119,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if not isinstance(tokens, list):
                 tokens = [tokens]
 
+            # Snapshot for the deferred bookkeeping.
             request: DynamicInferenceRequest = self.get_request(request_id)
 
             if self.num_speculative_tokens > 0:
@@ -1106,7 +1133,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
-            if request_id != self.context.chunked_prefill_request_id:
+            is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+            is_being_stop_word_finished = request_id in skip_for_stop_word
+            is_finished = request_id in finished_request_ids_set
+            was_first_token = False
+
+            if not is_chunked_prefill:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -1114,83 +1146,39 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
+                    # Trim log probs / top-n to match so the counts stay in sync.
                     keep = request.sampling_params.num_tokens_to_generate - len(
                         request.generated_tokens
                     )
                     tokens = tokens[:keep]
-                    # Trim log probs / top-n to match so the counts stay in sync.
                     if request_log_probs is not None:
                         request_log_probs = request_log_probs[:keep]
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
                         top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
-                if request_id not in self.stop_word_being_finished_ids:
-                    is_first_token = len(request.generated_tokens) == 0
-                    request.generated_tokens += tokens
-                    first_token_event = None
-                    if self.track_generated_token_events:
-                        for token in tokens:
-                            if block_allocator.enable_prefix_caching:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.total_count,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    blocks_ref_count=blocks_ref_count,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
-                            else:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.total_count,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
-                            if first_token_event is None:
-                                first_token_event = event
-                    if is_first_token:
-                        if not self.track_generated_token_events:
-                            first_token_event = DynamicInferenceEvent(
-                                type=DynamicInferenceEventType.GENERATED_TOKEN,
-                                payload={"token_id": tokens[0]},
-                            )
-                        request.ttft = (
-                            first_token_event.timestamp - request.event_add_engine.timestamp
-                        )
-                    if request.tpot is None:
-                        request.tpot = []
-                    per_token_step_time = step_time / len(tokens)
-                    request.tpot.extend([per_token_step_time] * len(tokens))
 
-                # Check for stop words (after token is appended).
-                # With speculative decoding, a stop word may end before the last
-                # appended token. The check truncates generated_tokens in-place and
-                # returns how many trailing tokens were removed so we can also trim
-                # the corresponding log probs below.
-                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
-                    request
-                )
+                stop_word_hit = False
+                if not is_being_stop_word_finished:
+                    was_first_token = len(request.generated_tokens) == 0
+                    # Sync-required: stop-word check reads generated_tokens.
+                    request.generated_tokens += tokens
+                    stop_word_hit, num_stop_word_trim = (
+                        self._check_stop_words_for_request_post_append(request)
+                    )
 
                 # Track acceptance statistics for logging.
                 if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
                     actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
 
-                    self._spec_tokens_proposed += actual_proposed
-                    self._spec_tokens_accepted += actual_accepted
+                    step_spec_tokens_proposed += actual_proposed
+                    step_spec_tokens_accepted += actual_accepted
 
-                if request_id in finished_request_ids:
+                if is_finished:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
+                    # Finalize the request's generated_length now; async still
+                    # does the pop + future.set_result + record append.
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    request.add_event_finish()
-                    finished_entry = self.requests.pop(request_id)
-                    finished_request = finished_entry.record[-1]
-                    finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -1205,102 +1193,19 @@ class DynamicInferenceEngine(AbstractEngine):
                 active_request_ids.append(request_id)
 
             # When a stop word was found mid-speculative-batch, trim log probs
-            # and top_n_logprobs to match the truncated generated_tokens.
+            # and top_n_logprobs to match the truncated generated_tokens
             if num_stop_word_trim > 0:
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_stop_word_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
-            # Process log_probs if available (unified for both regular and chunked prefill)
-            # Skip for requests being finished due to stop words — tokens are not
-            # appended for these requests, so log probs must also be skipped to keep
-            # the two lists in sync.
-            if (
-                request_log_probs is not None
-                and request_id not in self.stop_word_being_finished_ids
-            ):
-                # Initialize lists if they don't exist
-                if not request.prompt_log_probs:
-                    request.prompt_log_probs = []
-                if not request.generated_log_probs:
-                    request.generated_log_probs = []
-
-                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
-                is_prefill = len(request.generated_log_probs) == 0
-
-                if request.sampling_params.skip_prompt_log_probs:
-                    # We only want decode log probs.
-                    if is_chunked_prefill:
-                        pass
-                    elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        request.generated_log_probs.extend(request_log_probs)
-                else:
-                    # Split log probs between prompt and generated based on remaining prompt slots.
-                    prompt_length = len(request.prompt_tokens)
-                    total_accumulated = len(request.prompt_log_probs) + len(
-                        request.generated_log_probs
-                    )
-                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                    if split_idx > 0:
-                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                    if split_idx < len(request_log_probs):
-                        request.generated_log_probs.extend(request_log_probs[split_idx:])
-
-            # Process top_n_logprobs if available (unified for both regular and chunked prefill)
-            # Same stop-word guard as log probs above.
-            if (
-                top_n_logprobs is not None
-                and req_idx in top_n_logprobs
-                and request_id not in self.stop_word_being_finished_ids
-            ):
-                # Initialize lists if they don't exist
-                if request.prompt_top_n_logprobs is None:
-                    request.prompt_top_n_logprobs = []
-                if request.generated_top_n_logprobs is None:
-                    request.generated_top_n_logprobs = []
-
-                top_n_data_list = top_n_logprobs[req_idx]
-                prompt_length = len(request.prompt_tokens)
-
-                # Process each token's top-n logprobs
-                for top_n_values, top_n_indices in top_n_data_list:
-                    logit_dict = {}
-                    for logprob, logprob_index in zip(
-                        top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
-                    ):
-                        key = self.controller.tokenizer.detokenize([logprob_index])
-                        logit_dict[key] = logprob
-
-                    # Simple decision: check total count accumulated so far
-                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
-                        request.generated_top_n_logprobs
-                    )
-
-                    # If skip_prompt_log_probs is False and we haven't reached prompt end,
-                    # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
-                    if (
-                        not request.sampling_params.skip_prompt_log_probs
-                        and total_accumulated < prompt_length - 1
-                    ):
-                        request.prompt_top_n_logprobs.append(logit_dict)
-                    else:
-                        request.generated_top_n_logprobs.append(logit_dict)
-
-            # Process routing indices if available (keyed by request_id)
-            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            # Routing indices concat: done in sync to avoid snapshotting GPU tensors.
             if (
                 routing_indices_per_request is not None
                 and request_id in routing_indices_per_request
             ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ]  # [num_tokens, num_layers, topk]
+                step_routing = routing_indices_per_request[request_id]
                 if request.routing_indices is None:
                     request.routing_indices = step_routing.clone()
                 else:
@@ -1308,18 +1213,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         [request.routing_indices, step_routing], dim=0
                     )
 
+            per_request_state.append(
+                {
+                    "request_id": request_id,
+                    "req_idx": req_idx,
+                    "request": request,
+                    "tokens": tokens,
+                    "is_chunked_prefill": is_chunked_prefill,
+                    "is_being_stop_word_finished": is_being_stop_word_finished,
+                    "is_finished": is_finished,
+                    "was_first_token": was_first_token,
+                    "request_log_probs": request_log_probs,
+                }
+            )
+
         # Handle evicted requests.
+        # TODO: Split up eviction into separate synchronous and deferred steps.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
 
             evict_request_ids = evict_request_ids.tolist()
-
             # Insert into waiting_request_ids after any chunk prefill request.
             self.waiting_request_ids.extendleft(evict_request_ids)
             if self.context.chunked_prefill_request_id != -1:
                 chunked_prefill_id = self.waiting_request_ids[len(evict_request_ids)]
                 del self.waiting_request_ids[len(evict_request_ids)]
                 self.waiting_request_ids.appendleft(chunked_prefill_id)
-
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
                 self.requests[request_id].record.checkpoint()
@@ -1328,7 +1246,27 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
-        return active_request_ids, finished_request_records
+        num_finished = len(finished_request_ids_set)
+        num_evicted = evict_request_ids.numel() if evict_request_ids is not None else 0
+
+        return {
+            "active_request_ids": active_request_ids,
+            "per_request_state": per_request_state,
+            "step_time": step_time,
+            "top_n_logprobs": top_n_logprobs,
+            "skip_for_stop_word": skip_for_stop_word,
+            "blocks_total": blocks_total,
+            "blocks_allocated": blocks_allocated,
+            "blocks_hashed_active": blocks_hashed_active,
+            "blocks_ref_count": blocks_ref_count,
+            "pre_fwd_active_token_count": pre_fwd_active_token_count,
+            "pre_fwd_step_count": pre_fwd_step_count,
+            "num_finished": num_finished,
+            "num_evicted": num_evicted,
+            "spec_tokens_proposed_delta": step_spec_tokens_proposed,
+            "spec_tokens_accepted_delta": step_spec_tokens_accepted,
+            "spec_steps_delta": step_spec_steps,
+        }
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
@@ -1663,7 +1601,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
-        self.step_end_event.synchronize()
+        # Poll the CUDA event instead of blocking the event loop on synchronize().
+        while not self.step_end_event.query():
+            await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
@@ -1682,8 +1622,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
-            "finished_request_count": self.finished_request_count,
-            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1691,35 +1629,33 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_paused_block_count": self.context.kv_block_allocator.paused_count,
             "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
             "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            "post_forward_step_count": self.context.step_count,
+            "batch_dimensions": self.context.batch_dimensions,
+            "padded_batch_dimensions": self.context.padded_batch_dimensions,
+            "requests_dict_size": len(self.requests),
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
         return result, context_state, step_time
 
-    async def async_bookkeep(
+    def _post_process_requests_immediate(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
-    ):
-        """Uses `asyncio` for continuous bookkeeping.
+    ) -> Dict:
+        """Run the synchronous half of bookkeeping, required for the next forward step.
 
-        Args:
-            step_result (Optional[Dict]): The result of the step.
-            context_state (Dict): is_decode_only, total/paused request count, active token count.
-            step_time (float): How long this step took.
+        This phase must run between the current forward and the next forward.
 
-        Returns:
-            A dictionary containing:
-                active_requests (List): Requests that ran in the last step and are still active.
-                finished_requests (List): Requests that ran in the last step and have now finished.
-                step_time (float): The step time in seconds.
-                cuda_graph_request_count (int): The CUDA graph batch size matching this step.
+        Rule for adding new bookkeeping: if the next forward step reads it,
+        put it here; otherwise, put it in `_post_process_requests_deferred`.
         """
-        # Increment finished_request_count.
-        range_push("bookkeeping")
+        sync_time = time.time()
+        range_push("bookkeeping_sync")
         cuda_graph_request_count = None
+        newly_paused_refs: list = []
 
         if step_result is not None:
-            active_request_ids = step_result["active_request_ids"]
+            step_active_request_ids = step_result["active_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
@@ -1730,14 +1666,12 @@ class DynamicInferenceEngine(AbstractEngine):
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
-            # Add paused events.
+            # Snapshot newly-paused requests for the deferred bookkeeping.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
-                newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
+                newly_paused_refs = [self.get_request(i) for i in newly_paused_request_ids.tolist()]
 
-            # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
-                active_request_ids,
+            snapshot = self.post_process_requests(
+                step_active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
                 step_time,
@@ -1749,22 +1683,241 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
             )
-
         else:
-            active_request_ids: list[int] = []
-            finished_request_records: list[DynamicInferenceRequestRecord] = []
+            snapshot = {
+                "active_request_ids": [],
+                "per_request_state": [],
+                "step_time": step_time,
+                "top_n_logprobs": None,
+                "skip_for_stop_word": frozenset(),
+                "blocks_total": None,
+                "blocks_allocated": None,
+                "blocks_hashed_active": None,
+                "blocks_ref_count": None,
+                "pre_fwd_active_token_count": None,
+                "pre_fwd_step_count": None,
+                "num_finished": 0,
+                "num_evicted": 0,
+                "spec_tokens_proposed_delta": 0,
+                "spec_tokens_accepted_delta": 0,
+                "spec_steps_delta": 0,
+            }
+
+        # Snapshot finished requests for the deferred bookkeeping.
+        snapshot["failed_request_ids_snapshot"] = list(self.failed_request_ids)
+        self.failed_request_ids.clear()
+
+        # Snapshot prefix cache hit counters for the deferred bookkeeping.
+        snapshot["prefix_cache_hits_delta"] = 0
+        snapshot["prefix_cache_blocks_matched_delta"] = 0
+        if self.context.enable_prefix_caching:
+            snapshot["prefix_cache_hits_delta"] = self.context.prefix_cache_hits
+            snapshot["prefix_cache_blocks_matched_delta"] = self.context.prefix_cache_blocks_matched
+            self.context.prefix_cache_hits = 0
+            self.context.prefix_cache_blocks_matched = 0
+
+        # Snapshot lifetime counters at sync time to maintain self-consistency.
+        self.finished_request_count += snapshot["num_finished"]
+        self.evicted_request_count += snapshot["num_evicted"]
+
+        # Snapshot GPU memory stats only if we are logging.
+        post_forward_step_count = context_state["post_forward_step_count"]
+        snapshot["mem_stats"] = None
+        if (
+            self.logging_step_interval > 0
+            and post_forward_step_count % self.logging_step_interval == 0
+        ):
+            snapshot["mem_stats"] = torch.cuda.memory_stats()
+
+        # Snapshot the bookkeep queue depth to compare the actual lag with the configured lag.
+        snapshot["bookkeep_queue_depth"] = self._bookkeep_queue.qsize()
+
+        snapshot["context_state"] = context_state
+        snapshot["sync_time"] = sync_time
+        snapshot["finished_request_count"] = self.finished_request_count
+        snapshot["evicted_request_count"] = self.evicted_request_count
+        snapshot["newly_paused_refs"] = newly_paused_refs
+        snapshot["cuda_graph_request_count"] = cuda_graph_request_count
+
+        range_pop()
+
+        return snapshot
+
+    async def _apply_per_request_state_deferred(self, snapshot: Dict) -> List:
+        """Apply the snapshotted per-request state during deferred bookkeeping."""
+        step_time = snapshot["step_time"]
+        sync_time = snapshot["sync_time"]
+        per_request_state = snapshot["per_request_state"]
+        failed_request_ids_snapshot = snapshot["failed_request_ids_snapshot"]
+
+        top_n_logprobs = snapshot["top_n_logprobs"]
+        blocks_total = snapshot["blocks_total"]
+        blocks_allocated = snapshot["blocks_allocated"]
+        blocks_hashed_active = snapshot["blocks_hashed_active"]
+        blocks_ref_count = snapshot["blocks_ref_count"]
+        pre_fwd_active_token_count = snapshot["pre_fwd_active_token_count"]
+        pre_fwd_step_count = snapshot["pre_fwd_step_count"]
+
+        finished_request_records: list[DynamicInferenceRequestRecord] = []
+
+        # Pause events: use snapshotted checkpoint.
+        for paused_request in snapshot["newly_paused_refs"]:
+            paused_request.add_event_pause(timestamp=sync_time)
+
+        block_allocator = self.context.kv_block_allocator
+
+        for state in per_request_state:
+            request_id = state["request_id"]
+            req_idx = state["req_idx"]
+            request: DynamicInferenceRequest = state["request"]
+            tokens = state["tokens"]
+            is_chunked_prefill = state["is_chunked_prefill"]
+            is_being_stop_word_finished = state["is_being_stop_word_finished"]
+            is_finished = state["is_finished"]
+            was_first_token = state["was_first_token"]
+            request_log_probs = state["request_log_probs"]
+
+            if not is_chunked_prefill and not is_being_stop_word_finished:
+                # Token events. Timestamps use sync_time so they reflect the
+                # forward-completion wall clock, not the deferred-phase wall clock.
+                if self.track_generated_token_events:
+                    for token in tokens:
+                        if block_allocator.enable_prefix_caching:
+                            request.add_event_generated_token(
+                                token,
+                                blocks_total=blocks_total,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
+                                blocks_ref_count=blocks_ref_count,
+                                pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                pre_fwd_step_count=pre_fwd_step_count,
+                                timestamp=sync_time,
+                            )
+                        else:
+                            request.add_event_generated_token(
+                                token,
+                                blocks_total=blocks_total,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
+                                pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                pre_fwd_step_count=pre_fwd_step_count,
+                                timestamp=sync_time,
+                            )
+
+                if was_first_token and tokens:
+                    request.ttft = sync_time - request.event_add_engine.timestamp
+
+                if tokens:
+                    if request.tpot is None:
+                        request.tpot = []
+                    per_token_step_time = step_time / len(tokens)
+                    request.tpot.extend([per_token_step_time] * len(tokens))
+
+            # Finalize finished requests (pop, finish event, future resolution).
+            if is_finished and not is_chunked_prefill:
+                request.add_event_finish(timestamp=sync_time)
+                finished_entry = self.requests.pop(request_id)
+                finished_request_snapshot = finished_entry.record[-1]
+                finished_request_snapshot.generated_length = len(
+                    finished_request_snapshot.generated_tokens
+                )
+                finished_request_records.append(finished_entry.record)
+                finished_entry.future.set_result(finished_entry.record)
+
+            # log_probs append, gated on the sync-time skip-decision.
+            if request_log_probs is not None and not is_being_stop_word_finished:
+                if not request.prompt_log_probs:
+                    request.prompt_log_probs = []
+                if not request.generated_log_probs:
+                    request.generated_log_probs = []
+
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
+                else:
+                    prompt_length = len(request.prompt_tokens)
+                    total_accumulated = len(request.prompt_log_probs) + len(
+                        request.generated_log_probs
+                    )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
+
+            # Deferring this calculation is a significant optimization.
+            if (
+                top_n_logprobs is not None
+                and req_idx in top_n_logprobs
+                and not is_being_stop_word_finished
+            ):
+                if request.prompt_top_n_logprobs is None:
+                    request.prompt_top_n_logprobs = []
+                if request.generated_top_n_logprobs is None:
+                    request.generated_top_n_logprobs = []
+
+                top_n_data_list = top_n_logprobs[req_idx]
+                prompt_length = len(request.prompt_tokens)
+
+                for top_n_values, top_n_indices in top_n_data_list:
+                    logit_dict = {}
+                    for logprob, logprob_index in zip(
+                        top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
+                    ):
+                        key = self.controller.tokenizer.detokenize([logprob_index])
+                        logit_dict[key] = logprob
+
+                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                        request.generated_top_n_logprobs
+                    )
+                    if (
+                        not request.sampling_params.skip_prompt_log_probs
+                        and total_accumulated < prompt_length - 1
+                    ):
+                        request.prompt_top_n_logprobs.append(logit_dict)
+                    else:
+                        request.generated_top_n_logprobs.append(logit_dict)
+
+                # Yield after GPU->CPU transfers (top-n logprobs).
+                await asyncio.sleep(0)
 
         # Failed requests. Status and events were already set in _handle_failed_request;
         # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
+        for failed_request_id in failed_request_ids_snapshot:
             failed_entry = self.requests.pop(failed_request_id)
             finished_request_records.append(failed_entry.record)
             assert (
                 failed_entry.future.done()
             ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
 
-        range_pop()
+        return finished_request_records
+
+    async def _post_process_requests_deferred(self, snapshot: Dict) -> Dict:
+        """Run the deferrable half of bookkeeping from a saved snapshot.
+
+        This phase is allowed to lag behind the forward loop.
+
+        Rule for adding new bookkeeping: if the next forward step doesn't read
+        it, put it here; otherwise, put it in `_post_process_requests_immediate`.
+        """
+        step_time = snapshot["step_time"]
+        context_state = snapshot["context_state"]
+        active_request_ids = snapshot["active_request_ids"]
+        cuda_graph_request_count = snapshot["cuda_graph_request_count"]
+
+        finished_request_records = await self._apply_per_request_state_deferred(snapshot)
+
+        # Yield after the per-request work, before detokenization, so forward
+        # gets a chance to run if it was parked on its GPU future.
+        await asyncio.sleep(0)
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
@@ -1784,6 +1937,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
+                # Each iteration of this loop can be slow.
+                await asyncio.sleep(0)
             range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
@@ -1801,13 +1956,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 self.socket_for_receiving_requests.send(payload)
                 range_pop()
+            await asyncio.sleep(0)
 
-        # Drain prefix cache hit counters from context into engine accumulators.
-        if self.context.enable_prefix_caching:
-            self._prefix_cache_hits += self.context.prefix_cache_hits
-            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self.context.prefix_cache_hits = 0
-            self.context.prefix_cache_blocks_matched = 0
+        # Accumulate per-step deltas; only touched by deferred logic.
+        self._spec_tokens_proposed += snapshot["spec_tokens_proposed_delta"]
+        self._spec_tokens_accepted += snapshot["spec_tokens_accepted_delta"]
+        self._spec_steps += snapshot["spec_steps_delta"]
+        self._prefix_cache_hits += snapshot["prefix_cache_hits_delta"]
+        self._prefix_cache_blocks_matched += snapshot["prefix_cache_blocks_matched_delta"]
+
+        post_forward_step_count = context_state["post_forward_step_count"]
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1815,11 +1973,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
                 'inference/inference_step': int(
-                    self.inference_step_offset + int(self.context.step_count)
+                    self.inference_step_offset + int(post_forward_step_count)
                 ),
                 'inference/step_time_s': float(step_time),
-                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
-                'inference/total_requests_dict_size': int(len(self.requests)),
+                'inference/waiting_queue_len': int(context_state["waiting_request_count"]),
+                'inference/total_requests_dict_size': int(context_state["requests_dict_size"]),
+                'inference/bookkeep_queue_depth': int(snapshot["bookkeep_queue_depth"]),
             }
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
@@ -1853,29 +2012,30 @@ class DynamicInferenceEngine(AbstractEngine):
         # Print context state.
         if (
             self.logging_step_interval > 0
-            and self.context.step_count % self.logging_step_interval == 0
+            and post_forward_step_count % self.logging_step_interval == 0
         ):
-            mem = torch.cuda.memory_stats()
+            mem = snapshot["mem_stats"]
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
+                "bk_q: %d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    self.context.step_count,
-                    datetime.now().strftime("%H:%M:%S"),
+                    post_forward_step_count,
+                    datetime.fromtimestamp(snapshot["sync_time"]).strftime("%H:%M:%S"),
                     step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
-                            self.context.batch_dimensions,
+                            context_state["batch_dimensions"],
                             (
                                 "OFF"
-                                if not self.context.using_cuda_graph_this_step()
-                                else self.context.padded_batch_dimensions
+                                if not context_state["using_cuda_graph_this_step"]
+                                else context_state["padded_batch_dimensions"]
                             ),
                         )
                     ),
@@ -1883,12 +2043,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["max_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
-                    context_state["finished_request_count"],
-                    context_state["evicted_request_count"],
+                    snapshot["finished_request_count"],
+                    snapshot["evicted_request_count"],
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
                     context_state["total_paused_block_count"],
+                    snapshot["bookkeep_queue_depth"],
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
@@ -1943,10 +2104,28 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
-        # Keep for compatibility with current test suite.
-        return ret
+        step_result, context_state, step_time = await self.async_forward()
+        snapshot = self._post_process_requests_immediate(step_result, context_state, step_time)
+        return await self._post_process_requests_deferred(snapshot)
+
+    @trace_async_exceptions
+    async def _bookkeep_loop(self):
+        """Continuously dequeue immediate bookkeeping snapshots and run the deferred bookkeeping."""
+        try:
+            while True:
+                snapshot = await self._bookkeep_queue.get()
+                try:
+                    await self._post_process_requests_deferred(snapshot)
+                except Exception:
+                    # Surface the full snapshot before trace_async_exceptions sys.exits the process.
+                    logging.error("bookkeep deferred phase failed; snapshot=%r", snapshot)
+                    raise
+                finally:
+                    self._bookkeep_queue.task_done()
+        except asyncio_QueueShutDown:
+            pass
+        except asyncio.CancelledError:
+            pass
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
@@ -2154,12 +2333,39 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return len(all_messages)
 
+    async def _drain_bookkeep_queue(
+        self, bookkeep_task: asyncio.Task, *, signal_exit: bool = True
+    ) -> None:
+        """Drain the deferred bookkeeping snapshot queue, bringing it back in sync.
+
+        Args:
+            bookkeep_task (asyncio.Task): The task running the bookkeeping loop to monitor.
+            signal_exit (bool): Whether to shutdown the queue after draining.
+                Ignored when the bookkeep loop task has already died; in that case the
+                queue has already been shutdown.
+        """
+        join_task = asyncio.ensure_future(self._bookkeep_queue.join())
+        await asyncio.wait({join_task, bookkeep_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not join_task.done():
+            join_task.cancel()
+            try:
+                await join_task
+            except asyncio.CancelledError:
+                pass
+        if signal_exit or bookkeep_task.done():
+            self._bookkeep_queue.shutdown()
+
     async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.
 
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+
+        # Drain any pending bookkeep work and signal the loop to exit.
+        bookkeep_task = getattr(self, "_bookkeep_task", None)
+        if bookkeep_task is not None and not bookkeep_task.done():
+            await self._drain_bookkeep_queue(bookkeep_task)
 
         # Cleanup the request futures.
         for entry in self.requests.values():
@@ -2187,11 +2393,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # Set the stopped state at the very end.
         self._state_events[EngineState.STOPPED].set()
 
+        if bookkeep_task is not None:
+            try:
+                await bookkeep_task
+            except asyncio.CancelledError:
+                pass
+
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -2205,9 +2418,15 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         )
                     )
-                await self.async_step()
+                step_data = await self.async_forward()
+                snapshot = self._post_process_requests_immediate(*step_data)
+                await self._bookkeep_queue.put(snapshot)
+                if self.request_bookkeeping_lag == 0:
+                    await self._bookkeep_queue.join()
         except asyncio.CancelledError:
             pass
+        finally:
+            await self._drain_bookkeep_queue(self._bookkeep_task)
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
@@ -2281,14 +2500,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously.
 
         State-dependent behavior:
-        - RUNNING: EP all-reduce to check for work, then step or idle.
-        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - RUNNING: EP all-reduce to check for work, then forward or idle.
+        - PAUSING: EP all-reduce to reach consensus, drain bookkeep queue, then world barrier.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
 
         try:
             while True:
@@ -2303,20 +2523,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                     if all_pausing:
-                        # All EP peers are PAUSING: pause immediately.
+                        # All EP peers are PAUSING: drain bookkeep, then pause.
+                        await self._drain_bookkeep_queue(self._bookkeep_task, signal_exit=False)
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
-                            await self.async_step()
+                            step_data = await self.async_forward()
+                            snapshot = self._post_process_requests_immediate(*step_data)
+                            await self._bookkeep_queue.put(snapshot)
+                            if self.request_bookkeeping_lag == 0:
+                                await self._bookkeep_queue.join()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            self.step_end_event.synchronize()
+                            while not self.step_end_event.query():
+                                await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
