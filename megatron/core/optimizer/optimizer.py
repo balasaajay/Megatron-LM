@@ -387,28 +387,17 @@ class MegatronOptimizer(ABC):
         ):
             log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
 
-            if self.config.rl_offload_optimizer_during_inference:
-                # Pause the TMS region: frees physical pages for all TMS-managed tensors
-                # (fp32 master weights and Adam state) while preserving virtual addresses.
-                torch_memory_saver.pause(  # pylint: disable=possibly-used-before-assignment
-                    _OPTIMIZER_TMS_TAG
-                )
+            # Pause the TMS region: frees physical pages for all TMS-managed tensors
+            # (fp32 master weights and Adam state) while preserving virtual addresses.
+            torch_memory_saver.pause(  # pylint: disable=possibly-used-before-assignment
+                _OPTIMIZER_TMS_TAG
+            )
 
-                # View tensors (shard_fp32) are not in TMS; fall back to .cpu().
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and p.is_cuda and p._is_view():
-                            p.data = p.data.cpu()
-            else:
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and p.is_cuda:
-                            p.data = p.data.cpu()
-
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and v.is_cuda:
-                            state_dict[k] = v.cpu()
+            # View tensors (shard_fp32) are not in TMS; fall back to .cpu().
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and p.is_cuda and p._is_view():
+                        p.data = p.data.cpu()
 
             torch.cuda.empty_cache()
 
@@ -420,25 +409,14 @@ class MegatronOptimizer(ABC):
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
 
-            if self.config.rl_offload_optimizer_during_inference:
-                # Resume the TMS region: restores physical pages for TMS-managed tensors.
-                torch_memory_saver.resume(_OPTIMIZER_TMS_TAG)
+            # Resume the TMS region: restores physical pages for TMS-managed tensors.
+            torch_memory_saver.resume(_OPTIMIZER_TMS_TAG)
 
-                # Restore view tensors from CPU.
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and not p.is_cuda:
-                            p.data = p.data.cuda()
-            else:
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and not p.is_cuda:
-                            p.data = p.data.cuda()
-
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and not v.is_cuda:
-                            state_dict[k] = v.cuda()
+            # Restore view tensors from CPU.
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and not p.is_cuda:
+                        p.data = p.data.cuda()
 
     @staticmethod
     def _filter_and_reorder_param_groups(
