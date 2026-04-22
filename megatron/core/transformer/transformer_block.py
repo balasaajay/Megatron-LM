@@ -634,6 +634,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
+            if torch.distributed.get_rank() == 0:
+                logger.warning("[CUDAGRAPH_VERIFY] full_iteration_inference REPLAY (block)")
             kwargs['hidden_states'] = (
                 kwargs['hidden_states'].unwrap()
                 if isinstance(kwargs['hidden_states'], WrappedTensor)

@@ -1595,6 +1595,9 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
+            if torch.distributed.get_rank() == 0:
+                logger.warning("[CUDAGRAPH_VERIFY] TE layer-level REPLAY (training=%s, module=%s)",
+                               self.training, type(megatron_module).__name__)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
@@ -1647,6 +1650,9 @@ class CudaGraphManager(torch.nn.Module):
                 if not torch.is_grad_enabled():
                     # If the layer is frozen, we need to set the runner to eval mode.
                     runner.eval()
+                if torch.distributed.get_rank() == 0:
+                    logger.warning("[CUDAGRAPH_VERIFY] TE layer-level RECORD (training=%s, module=%s)",
+                                   self.training, type(megatron_module).__name__)
                 out = runner.record_graph_capture(args, kwargs)
             else:
                 # No cudagraphs were found in training mode with grad disabled, so fallback to

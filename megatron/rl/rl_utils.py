@@ -1861,9 +1861,11 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Set cudagraph scope for inference.
+    # Set cudagraph scope for inference
     model[0].config.cuda_graph_scope = args.cuda_graph_scope
     model[0].config.cuda_graph_impl = "local"
+    if dist.get_rank() == 0:
+        logger.warning("[CUDAGRAPH_VERIFY] Entering inference mode, scope=%s", args.cuda_graph_scope)
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -1932,6 +1934,9 @@ def megatron_rl_inference_mode(
             model[0].config.cuda_graph_scope = [
                 s for s in args.cuda_graph_scope if s != CudaGraphScope.full_iteration_inference
             ]
+        if dist.get_rank() == 0:
+            logger.warning("[CUDAGRAPH_VERIFY] Restored training scope=%s",
+                           model[0].config.cuda_graph_scope)
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:

@@ -184,8 +184,14 @@ class FullCudaGraphWrapper:
             logger.info(f'CUDA graph capture done for {training_str}!!!')
 
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
+            if torch.distributed.get_rank() == 0:
+                logger.warning("[CUDAGRAPH_VERIFY] full_iteration EAGER (phase=%s, iter=%d)",
+                               training_str, curr_iteration)
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
+            if torch.distributed.get_rank() == 0:
+                logger.warning("[CUDAGRAPH_VERIFY] full_iteration REPLAY (phase=%s, iter=%d)",
+                               training_str, curr_iteration)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
 
         self.next_iter(training_str)
