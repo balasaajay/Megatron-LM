@@ -418,6 +418,10 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
+    outputs:
+      mbridge_workflow_id: ${{ steps.trigger_mbridge_tests.outputs.workflow_id }}
+      mbridge_workflow_url: ${{ steps.trigger_mbridge_tests.outputs.workflow_url }}
+      mbridge_conclusion: ${{ steps.trigger_mbridge_tests.outputs.conclusion }}
     # skip downstream mbridge testing on PR pushes by
     # default. They still run for merge_group and nightly (schedule /
     # workflow_dispatch) triggers, and PR authors can opt in by adding the
@@ -461,6 +465,7 @@ jobs:
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
       - name: Trigger MBridge tests
+        id: trigger_mbridge_tests
         uses: convictional/trigger-workflow-and-wait@v1.6.5
         env:
           MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
@@ -471,7 +476,7 @@ jobs:
           github_token: ${{ secrets.PAT }}
           ref: ${{ env.MBRIDGE_BRANCH_NAME }}
           wait_interval: 60
-          propagate_failure: true
+          propagate_failure: false
           client_payload: |
             {
               "mcore_ref": "${{ needs.configure.outputs.sha }}",
@@ -487,6 +492,18 @@ jobs:
           cd megatron-bridge
           git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
 
+      - name: Fail on unsuccessful MBridge tests
+        if: always() && steps.trigger_mbridge_tests.outputs.conclusion != 'success'
+        env:
+          MBRIDGE_CONCLUSION: ${{ steps.trigger_mbridge_tests.outputs.conclusion || 'unknown' }}
+          MBRIDGE_WORKFLOW_URL: ${{ steps.trigger_mbridge_tests.outputs.workflow_url }}
+        run: |
+          echo "MBridge downstream tests concluded with '${MBRIDGE_CONCLUSION}'."
+          if [ -n "${MBRIDGE_WORKFLOW_URL}" ]; then
+            echo "MBridge workflow: ${MBRIDGE_WORKFLOW_URL}"
+          fi
+          exit 1
+
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
     needs: [cicd-mbridge-testing]
@@ -496,6 +513,98 @@ jobs:
       always()
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
+      - name: Collect MBridge failure summary
+        id: mbridge_summary
+        if: needs.cicd-mbridge-testing.result == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          MBRIDGE_WORKFLOW_ID: ${{ needs.cicd-mbridge-testing.outputs.mbridge_workflow_id }}
+          MBRIDGE_WORKFLOW_URL: ${{ needs.cicd-mbridge-testing.outputs.mbridge_workflow_url }}
+          MBRIDGE_CONCLUSION: ${{ needs.cicd-mbridge-testing.outputs.mbridge_conclusion }}
+        run: |
+          set -euo pipefail
+
+          write_summary() {
+            local file="$1"
+            local delimiter="mbridge_summary_${RANDOM}_${RANDOM}"
+            {
+              echo "text<<${delimiter}"
+              cat "${file}"
+              echo "${delimiter}"
+            } >> "${GITHUB_OUTPUT}"
+          }
+
+          extract_error_snippet() {
+            local job_id="$1"
+            local log_file="$2"
+
+            gh api "repos/NVIDIA-NeMo/Megatron-Bridge/actions/jobs/${job_id}/logs" > "${log_file}" || return 1
+            sed -E 's/^[0-9TZ:.-]+ //' "${log_file}" \
+              | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
+              | grep -E '::error::|##\[error\]|Traceback|AssertionError|RuntimeError|Error:|FAILED|FAILURES|fatal:|Exception|No space left|Timed out|timeout' \
+              | grep -Ev 'Checking conclusion|Checking status|Conclusion is not success|Propagating failure' \
+              | tail -n 4 \
+              | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' \
+              | cut -c 1-180
+          }
+
+          summary_file="$(mktemp)"
+          if [ -z "${MBRIDGE_WORKFLOW_ID}" ]; then
+            {
+              echo "• Error: unable to determine the downstream MBridge workflow run."
+              echo "• Check: <https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|upstream cicd-mbridge-testing job>"
+            } > "${summary_file}"
+            write_summary "${summary_file}"
+            exit 0
+          fi
+
+          if [ -z "${MBRIDGE_WORKFLOW_URL}" ]; then
+            MBRIDGE_WORKFLOW_URL="https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${MBRIDGE_WORKFLOW_ID}"
+          fi
+
+          {
+            echo "• Downstream: <${MBRIDGE_WORKFLOW_URL}|MBridge workflow #${MBRIDGE_WORKFLOW_ID}> (${MBRIDGE_CONCLUSION:-unknown})"
+          } > "${summary_file}"
+
+          if ! jobs_json="$(gh api --paginate --slurp "repos/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${MBRIDGE_WORKFLOW_ID}/jobs?per_page=100")"; then
+            echo "• Error: failed to read downstream MBridge jobs. Check the downstream workflow run." >> "${summary_file}"
+            write_summary "${summary_file}"
+            exit 0
+          fi
+
+          failed_jobs_json="$(jq -c '[.[].jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required")]' <<< "${jobs_json}")"
+          failed_count="$(jq 'length' <<< "${failed_jobs_json}")"
+
+          if [ "${failed_count}" -eq 0 ]; then
+            echo "• Error: no failed downstream jobs found. Check the upstream cicd-mbridge-testing job." >> "${summary_file}"
+            write_summary "${summary_file}"
+            exit 0
+          fi
+
+          echo "• Failed downstream job error:" >> "${summary_file}"
+          while IFS=$'\t' read -r job_id job_name job_url job_conclusion; do
+            [ -n "${job_id}" ] || continue
+
+            echo "  • <${job_url}|${job_name}> (${job_conclusion})" >> "${summary_file}"
+            log_file="$(mktemp)"
+            snippet="$(extract_error_snippet "${job_id}" "${log_file}" || true)"
+            if [ -n "${snippet}" ]; then
+              {
+                echo '```'
+                echo "${snippet}"
+                echo '```'
+              } >> "${summary_file}"
+            else
+              echo "    _No concise error line found in the job log._" >> "${summary_file}"
+            fi
+          done < <(jq -r '.[:2][] | [.id, .name, .html_url, .conclusion] | @tsv' <<< "${failed_jobs_json}")
+
+          if [ "${failed_count}" -gt 2 ]; then
+            echo "• Plus $((failed_count - 2)) more failed downstream job(s)." >> "${summary_file}"
+          fi
+
+          write_summary "${summary_file}"
+
       - name: Send Slack alert
         uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
         with:
@@ -504,6 +613,7 @@ jobs:
             ${{ needs.cicd-mbridge-testing.result == 'success' && ':white_check_mark: *MBridge downstream tests passed*' || ':rotating_light: *MBridge downstream tests failed*' }}
             • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
             • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
+            ${{ needs.cicd-mbridge-testing.result == 'failure' && steps.mbridge_summary.outputs.text || '' }}
             ${{ needs.cicd-mbridge-testing.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
 
   cicd-compute-build-matrix:
