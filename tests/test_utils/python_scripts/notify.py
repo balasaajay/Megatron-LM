@@ -9,8 +9,8 @@ from nemo_ci_triage.notifications import notification
 
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-GITLAB_ENDPOINT = os.getenv("GITLAB_ENDPOINT", "gitlab-master.nvidia.com")
-PROJECT_URL = os.getenv("CI_PROJECT_URL", f"https://{GITLAB_ENDPOINT}/ADLR/megatron-lm")
+SERVER_URL = os.getenv("CI_SERVER_URL")
+PROJECT_URL = os.getenv("CI_PROJECT_URL")
 TAG_TEAM = os.getenv("TAG_TEAM", "0") == "1"
 TEAM_SLUG = os.getenv("TEAM_SLUG", "")
 
@@ -27,8 +27,7 @@ logger.setLevel(logging.INFO)
 
 
 def get_gitlab_handle():
-    server_url = os.getenv("CI_SERVER_URL", f"https://{GITLAB_ENDPOINT}")
-    return gitlab.Gitlab(server_url, private_token=os.getenv("RO_API_TOKEN"))
+    return gitlab.Gitlab(SERVER_URL, private_token=os.getenv("RO_API_TOKEN"))
 
 
 def _bridge_gpu(bridge_name: str) -> str:

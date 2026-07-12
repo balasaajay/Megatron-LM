@@ -59,7 +59,7 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
     sender = Mock()
 
     monkeypatch.setattr(notify, "WEBHOOK_URL", "https://slack.invalid/webhook")
-    monkeypatch.setattr(notify, "PROJECT_URL", "https://gitlab.example.com/ADLR/megatron-lm")
+    monkeypatch.setattr(notify, "PROJECT_URL", "https://ci.example.com/ADLR/megatron-lm")
     monkeypatch.setattr(notify, "get_pipeline_jobs", lambda *_args: pipeline_jobs)
     monkeypatch.setattr(notify.notification, "send_slack_notification", sender)
 
@@ -79,12 +79,11 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
 
     assert result.exit_code == 0
     assert (
-        notify.notification.JOB_URL_TEMPLATE
-        == "https://gitlab.example.com/ADLR/megatron-lm/-/jobs/{}"
+        notify.notification.JOB_URL_TEMPLATE == "https://ci.example.com/ADLR/megatron-lm/-/jobs/{}"
     )
     assert (
         notify.notification.PIPELINE_URL_TEMPLATE
-        == "https://gitlab.example.com/ADLR/megatron-lm/-/pipelines/{}"
+        == "https://ci.example.com/ADLR/megatron-lm/-/pipelines/{}"
     )
     sender.assert_called_once_with(
         "megatron-lm", "mr", pipeline_jobs, None, webhook_url="https://slack.invalid/webhook"

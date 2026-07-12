@@ -22,7 +22,8 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
       JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \ 
       uv pip install --no-cache-dir "jet-client~=2.0" --upgrade $JET_INDEX_URLS
 
-# Keep this in the internal-only stage so public CI has no internal GitLab dependency.
+# Keep this in the internal-only stage so public CI has no internal service dependency.
+ARG CI_SERVER_URL
 ARG NEMO_CI_TRIAGE_COMMIT=a7cfd1783585fb2f42c931bf1e63c34aec0de5b3
 RUN uv pip install --no-cache-dir \
-      "nemo-ci-triage @ https://gitlab-master.nvidia.com/abalasa/nemo-ci-triage/-/archive/${NEMO_CI_TRIAGE_COMMIT}/nemo-ci-triage-${NEMO_CI_TRIAGE_COMMIT}.tar.gz"
+      "nemo-ci-triage @ ${CI_SERVER_URL}/abalasa/nemo-ci-triage/-/archive/${NEMO_CI_TRIAGE_COMMIT}/nemo-ci-triage-${NEMO_CI_TRIAGE_COMMIT}.tar.gz"
