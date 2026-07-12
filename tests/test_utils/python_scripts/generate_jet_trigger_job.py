@@ -9,6 +9,26 @@ import yaml
 from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+TRIAGE_LOG_PATH = "jet_workload.log"
+TRIAGE_REPORT_PATH = "error_report.json"
+
+
+def build_test_script(command: str) -> str:
+    """Wrap a workload command with non-blocking error extraction."""
+    return "\n".join(
+        [
+            "set +e",
+            "set -o pipefail",
+            f"{command} 2>&1 | tee {TRIAGE_LOG_PATH}",
+            'exit_code=${PIPESTATUS[0]}',
+            "set -e",
+            (
+                f"python -m nemo_ci_triage {TRIAGE_LOG_PATH} "
+                f"--output {TRIAGE_REPORT_PATH} --exit-code \"$exit_code\" || true"
+            ),
+            'exit "$exit_code"',
+        ]
+    )
 
 
 @click.command()
@@ -223,8 +243,11 @@ def main(
                 "tags": job_tags,
                 "timeout": "7 days",
                 "needs": needs,
-                "script": [" ".join(script)],
-                "artifacts": {"paths": ["results/"], "when": "always"},
+                "script": [build_test_script(" ".join(script))],
+                "artifacts": {
+                    "paths": ["results/", TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH],
+                    "when": "always",
+                },
                 "allow_failure": test_case["spec"].get("allow_failure", False)
                 or test_case["spec"]["model"] == "gpt-nemo",
                 "retry": {
