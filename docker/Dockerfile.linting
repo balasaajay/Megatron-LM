@@ -21,3 +21,15 @@ ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
       JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \ 
       uv pip install --no-cache-dir "jet-client~=2.0" --upgrade $JET_INDEX_URLS
+
+# Install internal-only CI triage tooling from its public repository.
+ARG CI_SERVER_URL
+ARG NEMO_CI_TRIAGE_COMMIT=cd745e34edc8f5331d18ee25ab6ecd85979d7855
+RUN mkdir /tmp/nemo-ci-triage-2 && \
+      git -C /tmp/nemo-ci-triage-2 init --quiet && \
+      git -C /tmp/nemo-ci-triage-2 fetch --quiet --depth 1 \
+        "${CI_SERVER_URL}/abalasa/nemo-ci-triage-2.git" \
+        "${NEMO_CI_TRIAGE_COMMIT}" && \
+      git -C /tmp/nemo-ci-triage-2 checkout --quiet FETCH_HEAD && \
+      uv pip install --no-cache-dir /tmp/nemo-ci-triage-2 && \
+      rm -rf /tmp/nemo-ci-triage-2
