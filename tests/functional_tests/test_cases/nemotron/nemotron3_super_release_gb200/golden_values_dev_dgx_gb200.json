@@ -23880,12 +23880,10 @@
         }
     },
     "iteration-time": {
-        "start_step": 1,
+        "start_step": 10,
         "end_step": 23840,
         "step_interval": 5,
         "values": {
-            "1": "nan",
-            "5": "nan",
             "10": 29.74817,
             "15": "nan",
             "20": 13.1398,
